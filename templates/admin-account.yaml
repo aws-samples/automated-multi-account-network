@@ -1,0 +1,199 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provisions admin accounts of a Network, creating a central Transit Gateway and supporting resources
+
+Parameters:
+
+  NetworkName: 
+    Type: String
+    Description: Name for this Network. This needs to be the same across the network and needs to be unique in each account/region (i.e. if you have two Network in the same account and region they need to be named differently)
+
+  NetworkCidr: 
+    Type: String
+    Description: CIDR block associated with network (e.g. 10.0.0.0/8). This may be larger than VPC's /16 maximum, as VPCs will be created within this block. CIDR needs to be VPC-compatible.
+
+  MaxAccounts: 
+    Type: Number
+    Default: 16
+
+  PrimaryRegion:
+    Type: String
+    Description: Region selected as the main region (will host the central Transit Gateway and supporting resources)
+
+  SecondaryRegions:
+    Type: CommaDelimitedList
+    Description: Comma delimited list of any additional regions. May be empty
+
+  OrganizationUnitArn:
+    Type: String
+    Description: OU ARN to share the Transit Gateway and supporting resources with
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref AWS::Region, !Ref PrimaryRegion]
+  IsNotPrimaryRegion: !Not [Condition: IsPrimaryRegion]
+
+Resources:
+
+# Resources common to all regions (will be executed N times, for the number of regions)
+
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      AutoAcceptSharedAttachments: enable
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      Tags:
+      - Key: Name
+        Value: !Ref NetworkName
+      - Key: net:name
+        Value: !Ref NetworkName
+
+  TgwResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Properties:
+      Name: !Ref NetworkName
+      ResourceArns: 
+        - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway/${TransitGateway}'
+      Principals:
+        - !Ref OrganizationUnitArn
+
+  HelperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub <%= config.build.bucketPrefix %>${AWS::Region}
+        S3Key: <%= config.build.pathPrefix %>/<%= config.build.version %>/archive.zip
+      Handler: app.handler
+      Runtime: nodejs14.x
+      Timeout: 900
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${NetworkName}-NetworkRole'
+      Environment:
+        Variables:
+          LOG_LEVEL: <%= env.LOG_LEVEL %>
+          NETWORK_NAME: !Ref NetworkName
+          ADMIN_ACCOUNT: !Ref AWS::AccountId
+          PRIMARY_REGION: !Ref PrimaryRegion
+      Tags:
+        - Key: net:name
+          Value: !Ref NetworkName
+        - Key: net:depends-on-role
+          Value: !If [IsPrimaryRegion, !Ref NetworkRole, N/A]
+
+# Resources deployed only on main region (will be executed 1 time)
+
+  DynamodbTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPrimaryRegion
+    Properties:
+      TableName: !Sub Network-${NetworkName}
+      AttributeDefinitions: 
+        - AttributeName: Account
+          AttributeType: S
+        - AttributeName: Region
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Account
+          KeyType: HASH
+        - AttributeName: Region
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: net:name
+          Value: !Ref NetworkName
+
+  AdminAccountResourcesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: IsPrimaryRegion
+    Properties:
+      ManagedPolicyName: !Sub AdminAccountResourcesPolicy-${NetworkName}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'dynamodb:*'
+            Resource:
+              - !GetAtt DynamodbTable.Arn
+          - Effect: Allow
+            Action:
+              - ec2:DescribeTransitGateways
+              - ec2:DescribeTransitGatewayPeeringAttachments
+              - ec2:CreateTransitGatewayRoute
+              - ec2:CreateTransitGatewayPeeringAttachment
+              - ec2:DeleteTransitGatewayPeeringAttachment
+              - ec2:AcceptTransitGatewayPeeringAttachment
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ec2:SearchTransitGatewayRoutes
+              - ec2:DeleteTransitGatewayRoute
+            Resource:
+              - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway/${TransitGateway}'
+              - arn:aws:ec2:*:*:transit-gateway-route-table/*
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+            Resource: '*'
+            Condition:
+              StringEquals:
+                ec2:CreateAction: CreateTransitGatewayPeeringAttachment
+
+  NetworkRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: !Sub ${NetworkName}-NetworkRole
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ lambda.amazonaws.com ]
+          Action: [ sts:AssumeRole ]
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action: [ sts:AssumeRole ]
+          Condition:
+            ForAnyValue:StringLike:
+              aws:PrincipalOrgPaths: !Sub
+                - '${orgId}/*/${ouId}/*'
+                - orgId: !Select [1, !Split ['/', !Ref OrganizationUnitArn]]
+                  ouId: !Select [2, !Split ['/', !Ref OrganizationUnitArn]]
+      ManagedPolicyArns:
+        - !Ref AdminAccountResourcesPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: net:name
+          Value: !Ref NetworkName
+
+  InitMetadata:
+    Type: Custom::InitMetadata
+    Condition: IsPrimaryRegion
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+      NetworkCidr: !Ref NetworkCidr
+      SecondaryRegions: !Ref SecondaryRegions
+      Region: !Ref AWS::Region
+      RegionalTgwId: !Ref TransitGateway
+      NumAccounts: !Ref MaxAccounts
+
+# Resources deployed in all regions other than main regions  (will be executed N-1 times, for the number of regions)
+
+  RegionRegistration:
+    Type: Custom::SecondaryRegionRegistration
+    Condition: IsNotPrimaryRegion
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+      Region: !Ref AWS::Region
+      RegionalTgwId: !Ref TransitGateway
+
+  DefaultTgwRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Condition: IsNotPrimaryRegion
+    Properties:
+      DestinationCidrBlock: !Ref NetworkCidr
+      TransitGatewayAttachmentId: !GetAtt RegionRegistration.TgwPeeringAttachmentId
+      TransitGatewayRouteTableId: !GetAtt RegionRegistration.TgwRouteTableId

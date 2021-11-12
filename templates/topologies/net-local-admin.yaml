@@ -1,0 +1,232 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template creates a network of VPC across specified accounts and regions
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network configuration
+        Parameters:
+          - NetworkCidr
+          - OrganizationUnitArn
+          - SecondaryRegions
+          - BaselineTemplate
+    ParameterLabels:
+      NetworkCidr:
+        default: Network CIDR
+      OrganizationUnitArn:
+        default: Organization Unit ARN
+      SecondaryRegions:
+        default: Secondary Regions
+      BaselineTemplate:
+        default: Baseline Template
+
+Parameters:
+  NetworkCidr:
+    Type: String
+    Description: CIDR block associated with network (e.g. 10.0.0.0/8). This may be larger than VPC's /16 maximum, VPCs will be created within this block so it needs to be VPC-compatible.
+    Default: 10.0.0.0/8
+  OrganizationUnitArn:
+    Type: String
+    Description: ARN of the OU that contains accounts to join the network
+    Default: arn:aws:organizations::ACCOUNT_ID:ou/o-xxxxxxxxxxx/ou-xxxx-xxxxxxxxxx
+  SecondaryRegions:
+    Type: CommaDelimitedList
+    Description: Optional comma delimited list of any additional regions. May be empty
+    Default: us-east-2,us-west-1
+  BaselineTemplate:
+    Type: String
+    Description: Optional Cloudformation template to configure member accounts after VPC is provisioned. May be empty
+    Default: https://<%= config.build.bucketPrefix %><%= config.build.regions[0] %>.s3.amazonaws.com/<%= config.build.pathPrefix %>/<%= config.build.version %>/baselines/ec2-ssm.yaml
+
+Conditions:
+  HasSecondaryRegions: !Not [ !Equals [ !Join [ '', !Ref SecondaryRegions ], '' ] ]
+  HasBaselineTemplate: !Not [ !Equals [ !Ref BaselineTemplate, '' ] ]
+
+Resources:
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: NetworkResources
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTransitGateway
+                  - ec2:DescribeTransitGateways
+                  - ec2:DeleteTransitGateway
+                  - ec2:CreateTransitGatewayRoute
+                  - ec2:DescribeTransitGatewayRouteTables
+                  - ec2:DeleteTransitGatewayRoute
+                  - ec2:CreateTags
+                  - lambda:GetFunctionCodeSigningConfig
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:InvokeFunction
+                  - ram:CreateResourceShare
+                  - ram:DeleteResourceShare
+                  - ram:TagResource
+                  - iam:PassRole
+                  - kms:CreateGrant
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                Resource: '*'
+        # For more details reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-self-managed.html
+        - PolicyName: CloudformationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - cloudformation:*
+                  - sns:*
+                Resource: '*'
+
+  AdministrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AssumeRole-AWSCloudFormationStackSetExecutionRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !GetAtt ExecutionRole.Arn
+
+  PrimaryAdminRegionStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://<%= config.build.bucketPrefix %>${AWS::Region}.s3.amazonaws.com/<%= config.build.pathPrefix %>/<%= config.build.version %>/admin-account.yaml
+      Parameters:
+        NetworkCidr: !Ref NetworkCidr
+        NetworkName: !Ref AWS::StackName
+        MaxAccounts: 16
+        PrimaryRegion: !Ref AWS::Region
+        SecondaryRegions: !Join [ ',', !Ref SecondaryRegions ]
+        OrganizationUnitArn: !Ref OrganizationUnitArn
+
+  SecondaryAdminRegionsStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      StackSetName: !Sub ${AWS::StackName}-SecondaryRegions-AdminStackSet
+      TemplateURL: !Sub https://<%= config.build.bucketPrefix %>${AWS::Region}.s3.amazonaws.com/<%= config.build.pathPrefix %>/<%= config.build.version %>/admin-account.yaml
+      PermissionModel: SELF_MANAGED
+      ExecutionRoleName: !Ref ExecutionRole
+      AdministrationRoleARN: !GetAtt AdministrationRole.Arn
+      StackInstancesGroup: !If
+        - HasSecondaryRegions
+        - - DeploymentTargets: 
+              Accounts: [ !Ref AWS::AccountId ]
+            Regions: !Ref SecondaryRegions
+        - - !Ref AWS::NoValue
+      OperationPreferences:
+        MaxConcurrentPercentage: 100
+        FailureTolerancePercentage: 100
+        RegionConcurrencyType: PARALLEL
+      Capabilities:
+        - CAPABILITY_IAM
+      Parameters:
+        - ParameterKey: NetworkName
+          ParameterValue: !Ref AWS::StackName
+        - ParameterKey: NetworkCidr
+          ParameterValue: !Ref NetworkCidr
+        - ParameterKey: MaxAccounts
+          ParameterValue: '16'
+        - ParameterKey: PrimaryRegion
+          ParameterValue: !Ref AWS::Region
+        - ParameterKey: SecondaryRegions
+          ParameterValue: !Join [ ',', !Ref SecondaryRegions ]
+        - ParameterKey: OrganizationUnitArn
+          ParameterValue: !Ref OrganizationUnitArn
+    DependsOn: PrimaryAdminRegionStack
+
+  MemberStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      StackSetName: !Sub ${AWS::StackName}-MemberStackSet
+      TemplateURL: !Sub https://<%= config.build.bucketPrefix %>${AWS::Region}.s3.amazonaws.com/<%= config.build.pathPrefix %>/<%= config.build.version %>/member-account.yaml
+      PermissionModel: SERVICE_MANAGED
+      CallAs: DELEGATED_ADMIN
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: true
+      StackInstancesGroup:
+        - DeploymentTargets: 
+            OrganizationalUnitIds:
+              - !Select [2, !Split ['/', !Ref OrganizationUnitArn]]
+          Regions: !If
+            - HasSecondaryRegions
+            - !Split [',', !Join [ ',', [ !Ref AWS::Region, !Join [ ',', !Ref SecondaryRegions ] ] ] ]
+            - [ !Ref AWS::Region ]
+      OperationPreferences:
+        MaxConcurrentPercentage: 100
+        FailureTolerancePercentage: 100
+        RegionConcurrencyType: PARALLEL
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      Parameters:
+        - ParameterKey: NetworkName
+          ParameterValue: !Ref AWS::StackName
+        - ParameterKey: AdminAccount
+          ParameterValue: !Ref AWS::AccountId
+        - ParameterKey: PrimaryRegion
+          ParameterValue: !Ref AWS::Region
+    DependsOn: SecondaryAdminRegionsStackSet
+
+  BaselineStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Condition: HasBaselineTemplate
+    Properties:
+      StackSetName: !Sub ${AWS::StackName}-BaselineStackSet
+      TemplateURL: !Ref BaselineTemplate
+      PermissionModel: SERVICE_MANAGED
+      CallAs: DELEGATED_ADMIN
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: true
+      StackInstancesGroup:
+        - DeploymentTargets: 
+            OrganizationalUnitIds:
+              - !Select [2, !Split ['/', !Ref OrganizationUnitArn]]
+          Regions: !If
+            - HasSecondaryRegions
+            - !Split [',', !Join [ ',', [ !Ref AWS::Region, !Join [ ',', !Ref SecondaryRegions ] ] ] ]
+            - [ !Ref AWS::Region ]
+      OperationPreferences:
+        MaxConcurrentPercentage: 100
+        FailureTolerancePercentage: 100
+        RegionConcurrencyType: PARALLEL
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+        - CAPABILITY_AUTO_EXPAND
+      Parameters:
+        - ParameterKey: NetworkName
+          ParameterValue: !Ref AWS::StackName
+    DependsOn: SecondaryAdminRegionsStackSet

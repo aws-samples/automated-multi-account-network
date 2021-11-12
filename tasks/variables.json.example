@@ -1,0 +1,26 @@
+{
+  "env": {
+    "AWS_ACCESS_KEY_ID": "*******************",
+    "AWS_SECRET_ACCESS_KEY": "*******************",,
+    "AWS_PROFILE": "default",
+    "AWS_REGION": "us-east-1",
+    "LOG_LEVEL": "debug"
+  },
+  "build": {
+    "bucketPrefix": "mybucket-",
+    "pathPrefix": "net",
+    "regions": ["us-east-1", "us-east-2"]
+  },
+  "createBuckets": {
+    "policyTemplate": "policy-org-rw.json"
+  },
+  "deploy": {
+    "stackName": "network-dev",
+    "paramOverrides": {
+      "NetworkCidr": "10.0.0.0/8",
+      "OrganizationUnitArn": "arn:aws:organizations::ACCOUNT_ID:ou/o-xxxxxxxxxxx/ou-xxxx-xxxxxxxxxx",
+      "SecondaryRegions": "",
+      "BaselineTemplate": ""
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "root",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": "arn:aws:s3:::<%= config.build.bucketPrefix %><%= region %>/*",
+        "Condition": {
+            "ForAnyValue:StringLike": {
+                "aws:PrincipalOrgID": "<%= orgId %>"
+            }
+        }
+    }]
+}

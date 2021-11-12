@@ -1,0 +1,176 @@
+# Adapted from: https://aws.amazon.com/blogs/mt/automated-configuration-of-session-manager-without-an-internet-gateway/
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provides Session Manager access without an Internet Gateway to an instance in a private subnet.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuration
+        Parameters:
+          - pLatestAmiId
+          - pInstanceType
+    ParameterLabels:
+      pLatestAmiId:
+        default: Systems Manager Parameter for AMI
+      pInstanceType:
+        default: EC2 Instance Type
+Parameters:
+  # Systems Manager Parameter is used to find the latest Amazon Linux 2 AMI ID
+  # Amazon Linux 2 is preloaded with the SSM Agent
+  pLatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  pInstanceType:
+    Type: String
+    Default: t2.micro
+    Description: Select a valid instance type for your Region
+    AllowedValues:
+    # add instance types to this list as desired
+    - t2.micro
+    - t3.micro
+    - m4.large
+    - m5.large
+  
+  NetworkName:
+    Type: String
+
+Resources:
+
+  CallbackParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /net/${NetworkName}/baselines/${AWS::StackName}
+      Type: String
+      Value: !Ref AWS::StackName
+
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT1H
+    DependsOn: CallbackParameter
+
+  MemberMetadata:
+    Type: Custom::MemberMetadata
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NetworkName}-HelperFunction
+      SubnetsBitmask: 24
+      SubnetsNumber: 2
+    DependsOn: WaitCondition
+
+  # Three VPC endpoints are required for Session Manager without an internet gateway:
+  # 1. ssm
+  # 2. ssmmessages
+  # 3. ec2messages
+  # This solution will not work without in Regions that do not include all three 
+  # of these VPC endpoints
+
+  rSsmVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !GetAtt MemberMetadata.VpcId
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rSsmMessagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !GetAtt MemberMetadata.VpcId
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rEc2MessagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !GetAtt MemberMetadata.VpcId
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rEc2InstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: 
+        - !Ref rEc2InstanceRole
+  rEc2InstanceRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+          - 
+            Effect: Allow
+            Principal: 
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        # The managed IAM policy AmazonSSMManagedInstanceCore grants access to Session Manager
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  rEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref pLatestAmiId
+      InstanceType: !Ref pInstanceType
+      SubnetId: !Ref rPrivateSubnet
+      IamInstanceProfile: !Ref rEc2InstanceProfile 
+      SecurityGroupIds:
+        - !Ref rSecurityGroupEc2Instance
+  rPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: !GetAtt MemberMetadata.Subnet1
+      MapPublicIpOnLaunch: false
+      VpcId: !GetAtt MemberMetadata.VpcId
+  rSecurityGroupEc2Instance:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for EC2 Instance
+      VpcId: !GetAtt MemberMetadata.VpcId
+      SecurityGroupIngress:
+      - Description: allow outbound ICMP to the VPC
+        CidrIp: !GetAtt MemberMetadata.NetworkCidr
+        FromPort: -1
+        ToPort: -1
+        IpProtocol: icmp
+      SecurityGroupEgress:
+      - Description: allow outbound HTTPS to the VPC
+        CidrIp: 0.0.0.0/0
+        FromPort: -1
+        ToPort: -1
+        IpProtocol: "-1"
+  rSecurityGroupVpcEndpoint:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for VPC Endpoints
+      VpcId: !GetAtt MemberMetadata.VpcId
+      SecurityGroupIngress:
+      # The SSM Agent connects to Session Manager over TCP 443
+      - Description: allow inbound HTTPS from the EC2 instance
+        SourceSecurityGroupId: !Ref rSecurityGroupEc2Instance
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+      SecurityGroupEgress:
+      # The SSM Agent connects to Session Manager over TCP 443
+      - Description: allow outbound HTTPS to the VPC
+        CidrIp: !GetAtt MemberMetadata.Subnet1
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp

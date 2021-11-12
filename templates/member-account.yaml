@@ -1,0 +1,228 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provisions member accounts of a Network, creating a VPC and attachments to central Transit Gateway
+
+Parameters:
+
+  NetworkName: 
+    Type: String
+    Description: Name for this Network. This needs to be the same across the network and needs to be unique in each account/region (i.e. if you have two Network in the same account and region they need to be named differently)
+
+  AdminAccount:
+    Type: String
+    Description: Admin account specified when creating the Network
+
+  PrimaryRegion:
+    Type: String
+    Description: Main region specified when creating the Network
+
+Conditions:
+  IsAdminAccount: !Equals [ !Ref AWS::AccountId, !Ref AdminAccount ]
+
+Resources:
+
+# Resources deployed only on main region (will be executed 1 time)
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: NetMemberAccountResources
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:CreateSubnet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:SignalResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: CreateSubnet
+              - Effect: Allow
+                Action:
+                  - ec2:DeleteSubnet
+                  - ec2:DescribeRouteTables
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/net:name: !Ref NetworkName
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/net/${NetworkName}/*
+              - Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !Sub arn:aws:iam::${AdminAccount}:role/${NetworkName}-NetworkRole 
+      ManagedPolicyArns:
+        - !If [IsAdminAccount, !Sub 'arn:aws:iam::${AWS::AccountId}:policy/AdminAccountResourcesPolicy-${NetworkName}', !Ref AWS::NoValue]
+        - arn:aws:iam::aws:policy/AmazonVPCReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSOrganizationsReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+      - Key: net:name
+        Value: !Ref NetworkName
+
+
+# Resources common to all regions (will be executed N times, for the number of regions)
+
+  HelperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${NetworkName}-HelperFunction
+      Handler: app.handler
+      Runtime: nodejs14.x
+      Timeout: 900
+      Code:
+        S3Bucket: !Sub <%= config.build.bucketPrefix %>${AWS::Region}
+        S3Key: <%= config.build.pathPrefix %>/<%= config.build.version %>/archive.zip
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: <%= env.LOG_LEVEL %>
+          NETWORK_NAME: !Ref NetworkName
+          ADMIN_ACCOUNT: !Ref AdminAccount
+          PRIMARY_REGION: !Ref PrimaryRegion
+      Tags:
+        - Key: net:name
+          Value: !Ref NetworkName
+
+  MemberRegistration:
+    Type: Custom::MemberRegistration
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+
+  MemberMetadata:
+    Type: Custom::MemberMetadata
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+    DependsOn: MemberRegistration
+
+  SubnetsForAzs:
+    Type: Custom::AzSubnets
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+      VpcId: !Ref VPC
+      MemberCidr: !GetAtt MemberMetadata.MemberCidr
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !GetAtt MemberMetadata.MemberCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Ref NetworkName
+      - Key: net:name
+        Value: !Ref NetworkName
+
+  DefaultTgwRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !GetAtt SubnetsForAzs.VpcDefaultRouteTableId
+      DestinationCidrBlock: !GetAtt MemberMetadata.NetworkCidr
+      TransitGatewayId: !GetAtt MemberMetadata.RegionalTgwId
+    DependsOn: TransitGatewayAttachment
+
+  TransitGatewayAttachment: 
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties: 
+      SubnetIds: !GetAtt SubnetsForAzs.SubnetIds
+      TransitGatewayId: !GetAtt MemberMetadata.RegionalTgwId
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Ref NetworkName
+      - Key: net:name
+        Value: !Ref NetworkName
+
+  VpcIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /net/${NetworkName}/VpcId
+      Type: String
+      Value: !Ref VPC
+
+  MemberCidrParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /net/${NetworkName}/MemberCidr
+      Type: String
+      Value: !GetAtt MemberMetadata.MemberCidr
+
+  NetworkCidrParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /net/${NetworkName}/NetworkCidr
+      Type: String
+      Value: !GetAtt MemberMetadata.NetworkCidr
+
+  NetworkNetworkHelperFunctionArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /net/${NetworkName}/HelperFunctionArn
+      Type: String
+      Value: !GetAtt HelperFunction.Arn
+
+  CallbackTriggerEventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: CallbackTriggerEventRule
+      EventPattern: 
+        source: [ aws.ssm ]
+        detail-type: [ Parameter Store Change ]
+        detail: 
+          name: [ {prefix: !Sub '/net/${NetworkName}/baselines/' } ]
+          operation: [ Create ]
+      State: ENABLED
+      Targets: 
+        - Id: HelperFunction
+          Arn: !GetAtt HelperFunction.Arn
+          InputTransformer:
+            InputPathsMap:
+              parameterName : $.detail.name
+            InputTemplate: |
+              {
+                "ResourceType" : "Custom::CallbackTrigger",
+                "RequestType" : "Create",
+                "ResourceProperties" : {
+                  "BaselineParameterName": <parameterName>
+                }
+              }
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref HelperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CallbackTriggerEventRule.Arn
+
+  CallbackTrigger:
+    Type: Custom::CallbackTrigger
+    Properties:
+      ServiceToken: !GetAtt HelperFunction.Arn
+    DependsOn:
+      - CallbackTriggerEventRule
+      - VpcIdParameter
+      - MemberCidrParameter
+      - NetworkCidrParameter
+      - NetworkNetworkHelperFunctionArnParameter
