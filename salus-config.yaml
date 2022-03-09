@@ -1,0 +1,20 @@
+---
+reports:
+  - uri: file://./salus-report.txt
+    format: json
+    verbose: true
+
+# Array[String] or String.
+# Array[String] - lists all the scanner to execute if Salus determines that
+#                 they are relevant to the source code in the repository.
+# String        - value of "all" or "none" which will use all defined scanners or none of them respectively.
+active_scanners: all
+
+enforced_scanners:
+  - ReportNodeModules
+  
+scanner_configs:
+  ReportNodeModules:
+    include_dev_deps: true
+
+
