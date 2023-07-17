@@ -75,6 +75,8 @@ Resources:
                   - lambda:CreateFunction
                   - lambda:DeleteFunction
                   - lambda:InvokeFunction
+                  - lambda:TagResource
+                  - lambda:GetFunction
                   - ram:CreateResourceShare
                   - ram:DeleteResourceShare
                   - ram:TagResource
