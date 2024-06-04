@@ -75,6 +75,8 @@ Resources:
                   - lambda:CreateFunction
                   - lambda:DeleteFunction
                   - lambda:InvokeFunction
+                  - lambda:TagResource
+                  - lambda:GetFunction
                   - ram:CreateResourceShare
                   - ram:DeleteResourceShare
                   - ram:TagResource
@@ -146,7 +148,7 @@ Resources:
         - - !Ref AWS::NoValue
       OperationPreferences:
         MaxConcurrentPercentage: 100
-        FailureTolerancePercentage: 100
+        FailureTolerancePercentage: 0
         RegionConcurrencyType: PARALLEL
       Capabilities:
         - CAPABILITY_IAM
